@@ -25,6 +25,8 @@ pub struct Config {
     pub no_mise: Option<bool>,
     #[serde(default)]
     pub lockdown: Option<bool>,
+    #[serde(default)]
+    pub no_landlock: Option<bool>,
 }
 
 impl Config {
@@ -42,6 +44,9 @@ impl Config {
     }
     pub fn lockdown_enabled(&self) -> bool {
         self.lockdown == Some(true)
+    }
+    pub fn landlock_enabled(&self) -> bool {
+        self.no_landlock != Some(true)
     }
 }
 
@@ -184,6 +189,9 @@ pub fn merge(cli: &CliArgs, existing: Config) -> Config {
     if let Some(v) = cli.lockdown {
         config.lockdown = Some(v);
     }
+    if let Some(v) = cli.landlock {
+        config.no_landlock = Some(!v);
+    }
 
     config
 }
@@ -236,6 +244,7 @@ pub fn display_status(config: &Config) {
     bool_opt("Docker", config.no_docker);
     bool_opt("Display", config.no_display);
     bool_opt("Mise", config.no_mise);
+    bool_opt("Landlock", config.no_landlock);
     bool_opt("Lockdown", config.lockdown.map(|v| !v));
 }
 
@@ -364,6 +373,24 @@ another_removed_field = true
         assert_eq!(cfg.no_display, None);
         assert_eq!(cfg.no_mise, None);
         assert_eq!(cfg.lockdown, None);
+        assert_eq!(cfg.no_landlock, None);
+    }
+
+    #[test]
+    fn regression_v0_3_0_config_without_no_landlock() {
+        // v0.3.0 configs don't have no_landlock field.
+        // They must still parse and default to landlock enabled.
+        let toml = r#"
+command = ["claude"]
+rw_maps = []
+ro_maps = []
+no_gpu = false
+no_docker = false
+lockdown = false
+"#;
+        let cfg = parse_toml(toml).unwrap();
+        assert_eq!(cfg.no_landlock, None);
+        assert!(cfg.landlock_enabled());
     }
 
     #[test]
@@ -393,6 +420,7 @@ another_removed_field = true
             no_display: Some(false),
             no_mise: None,
             lockdown: Some(true),
+            no_landlock: Some(false),
         };
         let serialized = serialize_config(&config).unwrap();
         let deserialized = parse_toml(&serialized).unwrap();
@@ -404,6 +432,7 @@ another_removed_field = true
         assert_eq!(deserialized.no_display, config.no_display);
         assert_eq!(deserialized.no_mise, config.no_mise);
         assert_eq!(deserialized.lockdown, config.lockdown);
+        assert_eq!(deserialized.no_landlock, config.no_landlock);
     }
 
     // ── Merge tests ────────────────────────────────────────────
@@ -503,6 +532,7 @@ another_removed_field = true
             no_display: None,
             no_mise: Some(true),
             lockdown: Some(true),
+            no_landlock: Some(true),
             ..Config::default()
         };
         let cli = CliArgs::default();
@@ -512,6 +542,7 @@ another_removed_field = true
         assert_eq!(merged.no_display, None);
         assert_eq!(merged.no_mise, Some(true));
         assert_eq!(merged.lockdown, Some(true));
+        assert_eq!(merged.no_landlock, Some(true));
     }
 
     #[test]
@@ -531,6 +562,30 @@ another_removed_field = true
         assert_eq!(merged.no_display, Some(false));
         assert_eq!(merged.no_mise, Some(false));
         assert_eq!(merged.lockdown, Some(true));
+    }
+
+    #[test]
+    fn merge_landlock_flag_overrides() {
+        let existing = Config {
+            no_landlock: None,
+            ..Config::default()
+        };
+
+        // --landlock sets no_landlock to false
+        let cli = CliArgs {
+            landlock: Some(true),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing.clone());
+        assert_eq!(merged.no_landlock, Some(false));
+
+        // --no-landlock sets no_landlock to true
+        let cli = CliArgs {
+            landlock: Some(false),
+            ..CliArgs::default()
+        };
+        let merged = merge(&cli, existing);
+        assert_eq!(merged.no_landlock, Some(true));
     }
 
     #[test]
@@ -655,6 +710,25 @@ another_removed_field = true
     }
 
     #[test]
+    fn landlock_enabled_accessor() {
+        assert!(Config {
+            no_landlock: None,
+            ..Config::default()
+        }
+        .landlock_enabled());
+        assert!(!Config {
+            no_landlock: Some(true),
+            ..Config::default()
+        }
+        .landlock_enabled());
+        assert!(Config {
+            no_landlock: Some(false),
+            ..Config::default()
+        }
+        .landlock_enabled());
+    }
+
+    #[test]
     fn lockdown_enabled_accessor() {
         assert!(!Config {
             lockdown: None,
@@ -694,6 +768,7 @@ another_removed_field = true
             no_display: None,
             no_mise: None,
             lockdown: Some(false),
+            no_landlock: None,
         };
         save(&config);
 
@@ -721,7 +796,7 @@ another_removed_field = true
 
         let config = Config {
             command: vec!["bash".into()],
-            ..Config::default()
+            ..Default::default()
         };
         save(&config);
 

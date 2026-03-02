@@ -219,7 +219,7 @@ const BWRAP_ENV_VAR: &str = "BWRAP_BIN";
 const BWRAP_CANDIDATES: &[&str] =
     &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
 
-fn bwrap_binary_path() -> Result<PathBuf, String> {
+pub(crate) fn bwrap_binary_path() -> Result<PathBuf, String> {
     let mut override_error: Option<String> = None;
 
     if let Some(raw) = std::env::var_os(BWRAP_ENV_VAR) {

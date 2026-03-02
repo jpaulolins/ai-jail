@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-mod bwrap;
+pub(crate) mod bwrap;
+#[cfg(target_os = "linux")]
+mod landlock;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 
@@ -101,6 +103,17 @@ pub fn build_launch_command(config: &Config) -> LaunchCommand {
     }
 
     user_cmd
+}
+
+pub fn apply_landlock(config: &Config, project_dir: &Path, verbose: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        landlock::apply(config, project_dir, verbose);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, project_dir, verbose);
+    }
 }
 
 pub fn check() -> Result<(), String> {

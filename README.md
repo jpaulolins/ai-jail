@@ -94,7 +94,7 @@ For hostile/untrusted workloads, use `--lockdown` (see below).
 
 ai-jail is a thin wrapper around OS-level sandboxing, so its security properties depend on the backend:
 
-- `bwrap` (Linux): namespace + mount sandboxing in userspace.
+- `bwrap` (Linux): namespace + mount sandboxing in userspace, plus Landlock LSM for VFS-level access control (Linux 5.13+).
 - `sandbox-exec` / seatbelt (macOS): legacy policy interface to Apple sandbox rules.
 
 Some things to keep in mind:
@@ -173,6 +173,15 @@ Your real `$HOME` is replaced with a tmpfs. Dotfiles and dotdirs are selectively
 PID, UTS, and IPC namespaces are isolated. Hostname inside is `ai-sandbox`. The process dies when the parent exits (`--die-with-parent`).
 `--new-session` is on for non-interactive runs and always in `--lockdown`. In `--lockdown`, Linux also unshares network.
 
+### Landlock LSM (Linux)
+
+On Linux 5.13+, ai-jail applies [Landlock](https://landlock.io/) restrictions as defense-in-depth on top of bwrap. Landlock controls what the process can do at the VFS level, independent of mount namespaces. This closes attack vectors that bwrap alone doesn't cover: `/proc` escape routes, symlink tricks within allowed mounts, and acts as insurance against namespace bugs.
+
+- Uses ABI V3 (Linux 6.2+) with best-effort degradation to V1 on 5.13+ or no-op on older kernels.
+- Applied in the parent process before spawning bwrap, so restrictions inherit through fork+exec.
+- In `--lockdown`, Landlock rules are stricter: project is read-only, no home dotdirs, only `/tmp` is writable.
+- Disable with `--no-landlock` if it causes issues with specific tools.
+
 ### mise integration
 
 If [mise](https://mise.jdx.dev/) is found on `$PATH`, the sandbox automatically runs `mise trust && mise activate bash && mise env` before your command. This gives AI tools access to project-specific language versions. Disable with `--no-mise`.
@@ -204,6 +213,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--rw-map <PATH>` | Mount PATH read-write (repeatable) |
 | `--map <PATH>` | Mount PATH read-only (repeatable) |
 | `--lockdown` / `--no-lockdown` | Enable/disable strict read-only lockdown mode |
+| `--landlock` / `--no-landlock` | Enable/disable Landlock LSM (Linux 5.13+, default: on) |
 | `--gpu` / `--no-gpu` | Enable/disable GPU passthrough |
 | `--docker` / `--no-docker` | Enable/disable Docker socket |
 | `--display` / `--no-display` | Enable/disable X11/Wayland |
@@ -279,6 +289,7 @@ When CLI flags and an existing config are both present:
 | `no_docker` | bool | not set (auto) | `true` disables Docker socket |
 | `no_display` | bool | not set (auto) | `true` disables X11/Wayland |
 | `no_mise` | bool | not set (auto) | `true` disables mise integration |
+| `no_landlock` | bool | not set (auto) | `true` disables Landlock LSM (Linux only) |
 | `lockdown` | bool | not set (disabled) | `true` enables strict read-only lockdown mode |
 
 When a boolean field is not set, the feature is enabled if the resource exists on the host.

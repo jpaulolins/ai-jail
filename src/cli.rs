@@ -17,6 +17,7 @@ OPTIONS:
     --rw-map <PATH>         Mount PATH read-write inside sandbox (repeatable)
     --map <PATH>            Mount PATH read-only inside sandbox (repeatable)
     --lockdown / --no-lockdown Enable/disable strict read-only lockdown mode
+    --landlock / --no-landlock Enable/disable Landlock LSM (Linux 5.13+, default: on)
     --no-gpu / --gpu        Disable/enable GPU device passthrough (Linux only)
     --no-docker / --docker  Disable/enable Docker socket passthrough
     --no-display / --display Disable/enable X11/Wayland passthrough (Linux only)
@@ -36,6 +37,7 @@ pub struct CliArgs {
     pub rw_maps: Vec<PathBuf>,
     pub ro_maps: Vec<PathBuf>,
     pub lockdown: Option<bool>,
+    pub landlock: Option<bool>,
     pub gpu: Option<bool>,
     pub docker: Option<bool>,
     pub display: Option<bool>,
@@ -71,6 +73,8 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
             }
             Long("lockdown") => args.lockdown = Some(true),
             Long("no-lockdown") => args.lockdown = Some(false),
+            Long("landlock") => args.landlock = Some(true),
+            Long("no-landlock") => args.landlock = Some(false),
             Long("gpu") => args.gpu = Some(true),
             Long("no-gpu") => args.gpu = Some(false),
             Long("docker") => args.docker = Some(true),
@@ -213,6 +217,18 @@ mod tests {
     fn parse_no_lockdown() {
         let args = parse_test(&["--no-lockdown", "bash"]).unwrap();
         assert_eq!(args.lockdown, Some(false));
+    }
+
+    #[test]
+    fn parse_landlock() {
+        let args = parse_test(&["--landlock", "bash"]).unwrap();
+        assert_eq!(args.landlock, Some(true));
+    }
+
+    #[test]
+    fn parse_no_landlock() {
+        let args = parse_test(&["--no-landlock", "bash"]).unwrap();
+        assert_eq!(args.landlock, Some(false));
     }
 
     #[test]

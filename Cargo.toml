@@ -1,6 +1,6 @@
 [package]
 name = "ai-jail"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Sandbox for AI coding agents (bubblewrap on Linux, sandbox-exec on macOS)"
 license = "GPL-3.0-only"
@@ -18,6 +18,9 @@ serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
 
 [profile.release]
 strip = true

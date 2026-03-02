@@ -57,6 +57,9 @@ fn run() -> Result<i32, String> {
         config::save(&config);
     }
 
+    // Apply Landlock LSM restrictions (Linux 5.13+, best-effort)
+    sandbox::apply_landlock(&config, &project_dir, cli.verbose);
+
     // Handle dry run
     if cli.dry_run {
         let formatted =
