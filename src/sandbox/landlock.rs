@@ -85,7 +85,7 @@ fn collect_lockdown_paths(
     // System paths: read-only
     for p in &[
         "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt", "/sys",
-        "/run", "/dev",
+        "/run",
     ] {
         ro.push(PathBuf::from(p));
     }
@@ -95,11 +95,13 @@ fn collect_lockdown_paths(
 
     // /proc: read-write (bwrap writes /proc/self/uid_map)
     rw.push(PathBuf::from("/proc"));
+    // /dev: read-write for null/tty compatibility inside sandbox's private /dev
+    rw.push(PathBuf::from("/dev"));
 
     // /tmp: read-write (only writable user location)
     rw.push(PathBuf::from("/tmp"));
     if verbose {
-        output::verbose("Landlock lockdown: /tmp rw");
+        output::verbose("Landlock lockdown: /proc, /dev, /tmp rw");
     }
 
     // Project: read-only
@@ -202,10 +204,24 @@ fn collect_normal_paths(
 
     // Extra user mounts
     for p in &config.rw_maps {
-        rw.push(p.clone());
+        if super::path_exists(p) {
+            rw.push(p.clone());
+        } else {
+            output::warn(&format!(
+                "Landlock: rw map {} not found, skipping",
+                p.display()
+            ));
+        }
     }
     for p in &config.ro_maps {
-        ro.push(p.clone());
+        if super::path_exists(p) {
+            ro.push(p.clone());
+        } else {
+            output::warn(&format!(
+                "Landlock: ro map {} not found, skipping",
+                p.display()
+            ));
+        }
     }
     if verbose && (!config.rw_maps.is_empty() || !config.ro_maps.is_empty()) {
         output::verbose("Landlock: extra maps");
@@ -225,6 +241,23 @@ fn collect_normal_paths(
     // GPU devices
     if config.gpu_enabled() {
         collect_gpu_paths(&mut rw, verbose);
+    }
+
+    // Display runtime directory is bind-mounted by bwrap in normal mode.
+    // Ensure Landlock allows writes there for Wayland/XDG sockets.
+    if config.display_enabled() {
+        if let Ok(xdg_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            let xdg_path = PathBuf::from(&xdg_dir);
+            if xdg_path.is_dir() {
+                if verbose {
+                    output::verbose(&format!(
+                        "Landlock: XDG runtime {} rw",
+                        xdg_path.display()
+                    ));
+                }
+                rw.push(xdg_path);
+            }
+        }
     }
 
     // bwrap binary: read+execute (covered by from_read)
@@ -308,6 +341,10 @@ fn collect_gpu_paths(rw: &mut Vec<PathBuf>, verbose: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    // Tests mutating process-global env vars must hold this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn apply_disabled_is_noop() {
@@ -353,6 +390,13 @@ mod tests {
     }
 
     #[test]
+    fn lockdown_paths_dev_is_writable() {
+        let (ro, rw) = collect_lockdown_paths(Path::new("/tmp/proj"), false);
+        assert!(rw.contains(&PathBuf::from("/dev")));
+        assert!(!ro.contains(&PathBuf::from("/dev")));
+    }
+
+    #[test]
     fn normal_paths_project_is_writable() {
         let config = Config {
             no_gpu: Some(true),
@@ -389,15 +433,62 @@ mod tests {
 
     #[test]
     fn normal_paths_extra_maps_included() {
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-landlock-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_root);
+        let rw_extra = tmp_root.join("extra-rw");
+        let ro_extra = tmp_root.join("extra-ro");
+        let _ = std::fs::create_dir_all(&rw_extra);
+        let mut f = std::fs::File::create(&ro_extra).unwrap();
+        let _ = f.write_all(b"x");
+
         let config = Config {
             no_gpu: Some(true),
             no_docker: Some(true),
-            rw_maps: vec![PathBuf::from("/extra/rw")],
-            ro_maps: vec![PathBuf::from("/extra/ro")],
+            rw_maps: vec![rw_extra.clone()],
+            ro_maps: vec![ro_extra.clone()],
             ..Config::default()
         };
         let (ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
-        assert!(rw.contains(&PathBuf::from("/extra/rw")));
-        assert!(ro.contains(&PathBuf::from("/extra/ro")));
+        assert!(rw.contains(&rw_extra));
+        assert!(ro.contains(&ro_extra));
+
+        let _ = std::fs::remove_file(&ro_extra);
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn normal_paths_missing_extra_maps_are_skipped() {
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            rw_maps: vec![PathBuf::from("/definitely/missing/rw")],
+            ro_maps: vec![PathBuf::from("/definitely/missing/ro")],
+            ..Config::default()
+        };
+        let (ro, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(!rw.contains(&PathBuf::from("/definitely/missing/rw")));
+        assert!(!ro.contains(&PathBuf::from("/definitely/missing/ro")));
+    }
+
+    #[test]
+    fn normal_paths_display_runtime_included_when_enabled() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let tmp_root = std::env::temp_dir()
+            .join(format!("ai-jail-landlock-xdg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_root);
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &tmp_root) };
+
+        let config = Config {
+            no_gpu: Some(true),
+            no_docker: Some(true),
+            no_display: Some(false),
+            ..Config::default()
+        };
+        let (_, rw) = collect_normal_paths(&config, Path::new("/tmp"), false);
+        assert!(rw.contains(&tmp_root));
+
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

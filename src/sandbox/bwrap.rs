@@ -718,16 +718,6 @@ fn discover_base(
             src: hosts_file.to_path_buf(),
             dest: "/etc/hosts".into(),
         },
-    ];
-
-    if let Some((src, dest)) = resolv_mount {
-        mounts.push(Mount::FileRoBind {
-            src: src.to_path_buf(),
-            dest: dest.to_path_buf(),
-        });
-    }
-
-    mounts.extend([
         Mount::RoBind {
             src: "/opt".into(),
             dest: "/opt".into(),
@@ -748,7 +738,17 @@ fn discover_base(
         Mount::Tmpfs {
             dest: "/run".into(),
         },
-    ]);
+    ];
+
+    // Keep resolv mount after /run tmpfs. On WSL/systemd-resolved
+    // `/etc/resolv.conf` often points into `/run`, which must not
+    // be shadowed by a later tmpfs mount.
+    if let Some((src, dest)) = resolv_mount {
+        mounts.push(Mount::FileRoBind {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+        });
+    }
 
     mounts
 }
@@ -1276,6 +1276,40 @@ mod tests {
         assert!(
             !args.contains(&"--landlock-exec".to_string()),
             "dry-run must NOT include --landlock-exec when disabled"
+        );
+    }
+
+    #[test]
+    fn resolv_bind_after_run_tmpfs() {
+        let mounts = discover_base(
+            Path::new("/tmp/test-hosts"),
+            Some((
+                Path::new("/tmp/test-resolv"),
+                Path::new("/run/resolvconf/resolv.conf"),
+            )),
+        );
+
+        let mut run_tmpfs_idx = None;
+        let mut resolv_idx = None;
+        for (i, m) in mounts.iter().enumerate() {
+            match m {
+                Mount::Tmpfs { dest } if dest == Path::new("/run") => {
+                    run_tmpfs_idx = Some(i);
+                }
+                Mount::FileRoBind { dest, .. }
+                    if dest == Path::new("/run/resolvconf/resolv.conf") =>
+                {
+                    resolv_idx = Some(i);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(run_tmpfs_idx.is_some(), "expected tmpfs /run mount");
+        assert!(resolv_idx.is_some(), "expected resolv file bind mount");
+        assert!(
+            run_tmpfs_idx.unwrap() < resolv_idx.unwrap(),
+            "resolv bind must come after /run tmpfs"
         );
     }
 
