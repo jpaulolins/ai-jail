@@ -451,11 +451,18 @@ fn io_loop(master: &OwnedFd) {
 
         match poll(&mut fds, PollTimeout::from(100_u16)) {
             Ok(0) => {
-                flush_statusbar_if_safe(
-                    &stream,
-                    &mut pending_redraw,
-                    &mut pending_clamp,
-                );
+                // Timeout: if a redraw is pending, force it
+                // regardless of stream state. After 100ms of
+                // silence any partial escape sequence is stale.
+                if pending_redraw {
+                    stream = StreamState::new();
+                    crate::statusbar::redraw();
+                    if pending_clamp {
+                        crate::statusbar::clamp_cursor();
+                        pending_clamp = false;
+                    }
+                    pending_redraw = false;
+                }
                 continue;
             }
             Err(nix::errno::Errno::EINTR) => continue,
