@@ -196,61 +196,72 @@ impl ResetDetector {
         ResetEvent::None
     }
 
-    /// Scan output bytes and report whether we should redraw/reclamp.
-    fn scan(&mut self, data: &[u8]) -> ResetEvent {
+    /// Scan output bytes, returning the byte offset just past the
+    /// FIRST reset-triggering sequence.  Returns `None` if no reset
+    /// was found.  Only advances the state machine up to (and
+    /// including) the reset byte, so the caller can call again on
+    /// the remainder to find further resets.
+    fn scan_first_reset(&mut self, data: &[u8]) -> Option<usize> {
         let mut ev = ResetEvent::None;
-        for &b in data {
-            match self.state {
-                ResetScanState::Normal => {
-                    if b == 0x1b {
-                        self.state = ResetScanState::Esc;
-                    }
-                }
-                ResetScanState::Esc => match b {
-                    b'c' => {
-                        ev = ev.merge(ResetEvent::RedrawAndClamp);
-                        self.state = ResetScanState::Normal;
-                    }
-                    b'[' => {
-                        self.state = ResetScanState::Csi;
-                        self.params_len = 0;
-                        self.params_overflow = false;
-                    }
-                    0x20..=0x2f => {}
-                    0x1b => {}
-                    _ => {
-                        self.state = ResetScanState::Normal;
-                    }
-                },
-                ResetScanState::Csi => match b {
-                    0x30..=0x3f => self.push_param(b),
-                    0x20..=0x2f => self.state = ResetScanState::CsiInter,
-                    0x40..=0x7e => {
-                        ev = ev.merge(self.finish_csi(b));
-                        self.state = ResetScanState::Normal;
-                    }
-                    0x1b => self.state = ResetScanState::Esc,
-                    _ => self.state = ResetScanState::Normal,
-                },
-                ResetScanState::CsiInter => match b {
-                    0x20..=0x2f => {}
-                    0x40..=0x7e => {
-                        ev = ev.merge(self.finish_csi(b));
-                        self.state = ResetScanState::Normal;
-                    }
-                    0x1b => self.state = ResetScanState::Esc,
-                    _ => self.state = ResetScanState::Normal,
-                },
+        for (i, &b) in data.iter().enumerate() {
+            self.step(b, &mut ev);
+            if !matches!(ev, ResetEvent::None) {
+                return Some(i + 1);
             }
         }
-        ev
+        None
+    }
+
+    fn step(&mut self, b: u8, ev: &mut ResetEvent) {
+        match self.state {
+            ResetScanState::Normal => {
+                if b == 0x1b {
+                    self.state = ResetScanState::Esc;
+                }
+            }
+            ResetScanState::Esc => match b {
+                b'c' => {
+                    *ev = ev.merge(ResetEvent::RedrawAndClamp);
+                    self.state = ResetScanState::Normal;
+                }
+                b'[' => {
+                    self.state = ResetScanState::Csi;
+                    self.params_len = 0;
+                    self.params_overflow = false;
+                }
+                0x20..=0x2f => {}
+                0x1b => {}
+                _ => {
+                    self.state = ResetScanState::Normal;
+                }
+            },
+            ResetScanState::Csi => match b {
+                0x30..=0x3f => self.push_param(b),
+                0x20..=0x2f => self.state = ResetScanState::CsiInter,
+                0x40..=0x7e => {
+                    *ev = ev.merge(self.finish_csi(b));
+                    self.state = ResetScanState::Normal;
+                }
+                0x1b => self.state = ResetScanState::Esc,
+                _ => self.state = ResetScanState::Normal,
+            },
+            ResetScanState::CsiInter => match b {
+                0x20..=0x2f => {}
+                0x40..=0x7e => {
+                    *ev = ev.merge(self.finish_csi(b));
+                    self.state = ResetScanState::Normal;
+                }
+                0x1b => self.state = ResetScanState::Esc,
+                _ => self.state = ResetScanState::Normal,
+            },
+        }
     }
 }
 
 #[cfg(test)]
 fn contains_scroll_reset(data: &[u8]) -> bool {
     let mut detector = ResetDetector::new();
-    !matches!(detector.scan(data), ResetEvent::None)
+    detector.scan_first_reset(data).is_some()
 }
 
 #[derive(Clone, Copy)]
@@ -407,6 +418,48 @@ impl StreamState {
     }
 }
 
+/// Forward a chunk of child output to stdout, splitting at any
+/// scroll-region-resetting sequence so the status bar is
+/// re-established before subsequent bytes reach the terminal.
+fn forward_child_chunk(
+    data: &[u8],
+    reset: &mut ResetDetector,
+    stream: &mut StreamState,
+    pending_redraw: &mut bool,
+    pending_clamp: &mut bool,
+) {
+    let mut remaining = data;
+    loop {
+        match reset.scan_first_reset(remaining) {
+            None => {
+                // No (more) resets — write the rest and return.
+                write_all_raw(nix::libc::STDOUT_FILENO, remaining);
+                stream.update(remaining);
+                *pending_redraw = true;
+                return;
+            }
+            Some(split) => {
+                // Write bytes up to and including the reset
+                // sequence, then re-establish the scroll region
+                // before the next bytes reach the terminal.
+                write_all_raw(nix::libc::STDOUT_FILENO, &remaining[..split]);
+                stream.update(&remaining[..split]);
+                *pending_clamp = true;
+                crate::statusbar::redraw();
+                crate::statusbar::clamp_cursor();
+                *pending_clamp = false;
+                *pending_redraw = false;
+
+                remaining = &remaining[split..];
+                if remaining.is_empty() {
+                    return;
+                }
+                // Loop to handle further resets in the same chunk.
+            }
+        }
+    }
+}
+
 fn flush_statusbar_if_safe(
     stream: &StreamState,
     pending_redraw: &mut bool,
@@ -476,28 +529,13 @@ fn io_loop(master: &OwnedFd) {
                 match nix::unistd::read(master_raw, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        write_all_raw(nix::libc::STDOUT_FILENO, &buf[..n]);
-                        let reset_ev = reset.scan(&buf[..n]);
-                        if matches!(reset_ev, ResetEvent::RedrawAndClamp) {
-                            pending_clamp = true;
-                        }
-                        stream.update(&buf[..n]);
-                        // Any child output may have overwritten
-                        // the status bar row; always refresh once
-                        // the child goes quiet.
-                        pending_redraw = true;
-                        // When the child resets the scroll region,
-                        // re-establish it immediately so subsequent
-                        // output in the same burst doesn't render
-                        // on the status bar row.
-                        if !matches!(reset_ev, ResetEvent::None) {
-                            crate::statusbar::redraw();
-                            if pending_clamp {
-                                crate::statusbar::clamp_cursor();
-                                pending_clamp = false;
-                            }
-                            pending_redraw = false;
-                        }
+                        forward_child_chunk(
+                            &buf[..n],
+                            &mut reset,
+                            &mut stream,
+                            &mut pending_redraw,
+                            &mut pending_clamp,
+                        );
                     }
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(nix::errno::Errno::EIO) => break,
@@ -511,21 +549,13 @@ fn io_loop(master: &OwnedFd) {
                     match nix::unistd::read(master_raw, &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            write_all_raw(nix::libc::STDOUT_FILENO, &buf[..n]);
-                            let reset_ev = reset.scan(&buf[..n]);
-                            if matches!(reset_ev, ResetEvent::RedrawAndClamp) {
-                                pending_clamp = true;
-                            }
-                            stream.update(&buf[..n]);
-                            pending_redraw = true;
-                            if !matches!(reset_ev, ResetEvent::None) {
-                                crate::statusbar::redraw();
-                                if pending_clamp {
-                                    crate::statusbar::clamp_cursor();
-                                    pending_clamp = false;
-                                }
-                                pending_redraw = false;
-                            }
+                            forward_child_chunk(
+                                &buf[..n],
+                                &mut reset,
+                                &mut stream,
+                                &mut pending_redraw,
+                                &mut pending_clamp,
+                            );
                         }
                     }
                 }
@@ -768,8 +798,45 @@ mod tests {
     #[test]
     fn detect_split_alt_screen_exit_across_chunks() {
         let mut detector = ResetDetector::new();
-        assert!(matches!(detector.scan(b"\x1b[?1049"), ResetEvent::None));
-        assert!(matches!(detector.scan(b"l"), ResetEvent::RedrawAndClamp));
+        assert!(detector.scan_first_reset(b"\x1b[?1049").is_none());
+        assert!(detector.scan_first_reset(b"l").is_some());
+    }
+
+    #[test]
+    fn scan_first_reset_returns_split_offset() {
+        let mut detector = ResetDetector::new();
+        // \x1b[r is 3 bytes; data after it should be at offset 3
+        let data = b"\x1b[rHello";
+        assert_eq!(detector.scan_first_reset(data), Some(3));
+    }
+
+    #[test]
+    fn scan_first_reset_embedded_in_output() {
+        let mut detector = ResetDetector::new();
+        let data = b"prefix\x1b[rsuffix";
+        // "prefix" (6) + "\x1b[r" (3) = offset 9
+        assert_eq!(detector.scan_first_reset(data), Some(9));
+    }
+
+    #[test]
+    fn scan_first_reset_none_for_clean_data() {
+        let mut detector = ResetDetector::new();
+        assert!(detector.scan_first_reset(b"just text\n").is_none());
+    }
+
+    #[test]
+    fn scan_first_reset_multiple_resets() {
+        let mut detector = ResetDetector::new();
+        let data = b"\x1b[rABC\x1b[rDEF";
+        // First call: finds first \x1b[r at offset 3
+        assert_eq!(detector.scan_first_reset(data), Some(3));
+        // Call again on remainder to find the second reset
+        assert_eq!(
+            detector.scan_first_reset(&data[3..]),
+            Some(6) // "ABC\x1b[r" = 3 + 3 = 6 offset in remainder
+        );
+        // Call again on final remainder — no more resets
+        assert!(detector.scan_first_reset(&data[9..]).is_none());
     }
 
     #[test]
