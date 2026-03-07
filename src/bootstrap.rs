@@ -105,8 +105,6 @@ const ALLOW: &[&str] = &[
 ];
 
 const DENY: &[&str] = &[
-    "Bash(rm -rf *)",
-    "Bash(rm -r *)",
     "Bash(sudo *)",
     "Bash(chmod 777 *)",
     "Bash(git reset --hard *)",
@@ -617,7 +615,6 @@ mod tests {
         assert!(allow.iter().any(|v| v == "WebSearch"));
 
         let deny = obj["deny"].as_array().unwrap();
-        assert!(deny.iter().any(|v| v == "Bash(rm -rf *)"));
         assert!(deny.iter().any(|v| v == "Bash(sudo *)"));
 
         let ask = obj["ask"].as_array().unwrap();
