@@ -477,10 +477,8 @@ fn io_loop(master: &OwnedFd) {
                     Ok(0) => break,
                     Ok(n) => {
                         write_all_raw(nix::libc::STDOUT_FILENO, &buf[..n]);
-                        if matches!(
-                            reset.scan(&buf[..n]),
-                            ResetEvent::RedrawAndClamp
-                        ) {
+                        let reset_ev = reset.scan(&buf[..n]);
+                        if matches!(reset_ev, ResetEvent::RedrawAndClamp) {
                             pending_clamp = true;
                         }
                         stream.update(&buf[..n]);
@@ -488,6 +486,18 @@ fn io_loop(master: &OwnedFd) {
                         // the status bar row; always refresh once
                         // the child goes quiet.
                         pending_redraw = true;
+                        // When the child resets the scroll region,
+                        // re-establish it immediately so subsequent
+                        // output in the same burst doesn't render
+                        // on the status bar row.
+                        if !matches!(reset_ev, ResetEvent::None) {
+                            crate::statusbar::redraw();
+                            if pending_clamp {
+                                crate::statusbar::clamp_cursor();
+                                pending_clamp = false;
+                            }
+                            pending_redraw = false;
+                        }
                     }
                     Err(nix::errno::Errno::EINTR) => {}
                     Err(nix::errno::Errno::EIO) => break,
@@ -502,14 +512,20 @@ fn io_loop(master: &OwnedFd) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             write_all_raw(nix::libc::STDOUT_FILENO, &buf[..n]);
-                            if matches!(
-                                reset.scan(&buf[..n]),
-                                ResetEvent::RedrawAndClamp
-                            ) {
+                            let reset_ev = reset.scan(&buf[..n]);
+                            if matches!(reset_ev, ResetEvent::RedrawAndClamp) {
                                 pending_clamp = true;
                             }
                             stream.update(&buf[..n]);
                             pending_redraw = true;
+                            if !matches!(reset_ev, ResetEvent::None) {
+                                crate::statusbar::redraw();
+                                if pending_clamp {
+                                    crate::statusbar::clamp_cursor();
+                                    pending_clamp = false;
+                                }
+                                pending_redraw = false;
+                            }
                         }
                     }
                 }
