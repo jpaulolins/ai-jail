@@ -115,8 +115,10 @@ fn run() -> Result<i32, String> {
     // Set up status bar if enabled and stdio is attached to a terminal
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let use_status_bar =
-        config.status_bar_enabled() && stdout_is_tty && stdin_is_tty;
+    let use_status_bar = config.status_bar_enabled()
+        && stdout_is_tty
+        && stdin_is_tty
+        && !cli.exec;
     if cli.verbose {
         if config.status_bar_enabled() {
             if stdout_is_tty && stdin_is_tty {

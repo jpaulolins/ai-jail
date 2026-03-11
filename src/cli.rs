@@ -26,6 +26,7 @@ OPTIONS:
     --no-mise / --mise      Disable/enable mise integration
     -s, --status-bar[=light] Set status line theme (default on, dark unless =light)
     --no-status-bar          Disable persistent status line
+    --exec                   Direct execution mode (no PTY proxy, no status bar)
     --clean                 Ignore existing .ai-jail config, start fresh
     --dry-run               Print the sandbox command without executing
     --init                  Create/update .ai-jail config and exit
@@ -50,6 +51,7 @@ pub struct CliArgs {
     pub mise: Option<bool>,
     pub status_bar: Option<bool>,
     pub status_bar_style: Option<String>,
+    pub exec: bool,
     pub clean: bool,
     pub dry_run: bool,
     pub init: bool,
@@ -117,6 +119,10 @@ pub fn parse_from(mut parser: lexopt::Parser) -> Result<CliArgs, String> {
                 }
             }
             Long("no-status-bar") => args.status_bar = Some(false),
+            Long("exec") => {
+                args.exec = true;
+                args.status_bar = Some(false);
+            }
             Long("landlock-exec") => args.landlock_exec = true,
             Long("clean") => args.clean = true,
             Long("dry-run") => args.dry_run = true,
@@ -427,6 +433,40 @@ mod tests {
         assert_eq!(args.lockdown, Some(true));
         assert!(args.verbose);
         assert_eq!(args.command, vec!["bash"]);
+    }
+
+    // ── Exec mode ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_exec_simple() {
+        let args = parse_test(&["--exec", "my-script.sh"]).unwrap();
+        assert!(args.exec);
+        assert_eq!(args.status_bar, Some(false));
+        assert_eq!(args.command, vec!["my-script.sh"]);
+    }
+
+    #[test]
+    fn parse_exec_with_args() {
+        let args = parse_test(&[
+            "--exec",
+            "--",
+            "my-script.sh",
+            "--flag",
+            "-o",
+            "out",
+        ])
+        .unwrap();
+        assert!(args.exec);
+        assert_eq!(args.command, vec!["my-script.sh", "--flag", "-o", "out"]);
+    }
+
+    #[test]
+    fn parse_exec_with_sandbox_flags() {
+        let args = parse_test(&["--lockdown", "--exec", "--", "cargo", "test"])
+            .unwrap();
+        assert!(args.exec);
+        assert_eq!(args.lockdown, Some(true));
+        assert_eq!(args.command, vec!["cargo", "test"]);
     }
 
     // ── Dash-dash separator ────────────────────────────────────

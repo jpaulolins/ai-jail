@@ -246,6 +246,7 @@ If no command is given and no `.ai-jail` config exists, defaults to `bash`.
 | `--mise` / `--no-mise` | Enable/disable mise integration |
 | `-s`, `--status-bar[=light]` | Enable persistent status line (dark or light theme) |
 | `--no-status-bar` | Disable persistent status line |
+| `--exec` | Direct execution mode (no PTY proxy, no status bar) |
 | `--clean` | Ignore existing config, start fresh |
 | `--dry-run` | Print the bwrap command without executing |
 | `--init` | Create/update config and exit (don't run) |
@@ -265,6 +266,9 @@ ai-jail --map /opt/datasets claude
 
 # No GPU, no Docker, just the basics
 ai-jail --no-gpu --no-docker claude
+
+# Run a one-shot command and capture its output
+result=$(ai-jail --exec -- my-script.sh --flag1 --flag2)
 
 # Suspicious/untrusted workload mode
 ai-jail --lockdown bash
