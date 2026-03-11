@@ -2,13 +2,19 @@
 //!
 //! When the status bar is enabled, ai-jail interposes a PTY between
 //! itself and the sandbox child. The child writes to the PTY slave
-//! while ai-jail owns the real terminal. Child output is processed
-//! through a vt100 virtual terminal and diff-rendered to the real
-//! terminal, giving ai-jail full control over screen content.
+//! while ai-jail owns the real terminal.
 //!
-//! This approach (similar to tmux/screen) eliminates ghost status
-//! bars on resize: the virtual terminal is resized, its content is
-//! re-rendered, and the status bar is redrawn cleanly.
+//! Rendering uses a hybrid approach:
+//!   - **Primary screen**: raw pass-through with a scroll region
+//!     protecting the status bar. This preserves natural terminal
+//!     scrollback. vt100 processes the output in parallel for
+//!     resize recovery.
+//!   - **Alternate screen** (vim, less, etc.): cursor-addressed
+//!     diff-rendering via vt100::state_diff. No scrollback needed.
+//!
+//! On resize, the vt100 virtual terminal is resized first, then
+//! its state is re-rendered to the real terminal, giving ai-jail
+//! full control over screen recovery.
 
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::termios::{self, SetArg, Termios};
@@ -113,48 +119,65 @@ fn set_initial_size(fd: &OwnedFd, rows: u16, cols: u16) {
     }
 }
 
+/// Set terminal scroll region to rows 1..content_rows (1-based).
+/// Status bar lives on row content_rows+1, outside the region.
+fn set_scroll_region(fd: i32, content_rows: u16) {
+    let seq = format!("\x1b[1;{}r", content_rows);
+    write_all_raw(fd, seq.as_bytes());
+}
+
 fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let master_raw = master.as_raw_fd();
     let stdin_bfd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
     let master_bfd = unsafe { BorrowedFd::borrow_raw(master_raw) };
     let mut buf = [0u8; 8192];
+    let stdout = nix::libc::STDOUT_FILENO;
 
-    // Virtual terminal: rows-1 to leave room for status bar.
-    // No scrollback needed — the real terminal handles that via
-    // the diff-rendered output we send to stdout.
-    let mut parser = vt100::Parser::new(init_rows - 1, init_cols, 0);
+    // Track content area size (updated on SIGWINCH)
+    let mut content_rows = init_rows - 1;
+    let mut content_cols = init_cols;
+
+    // Virtual terminal for resize recovery and alt-screen
+    // diff rendering. Scrollback of 0 is fine — the real
+    // terminal handles scrollback via raw pass-through.
+    let mut parser = vt100::Parser::new(content_rows, content_cols, 0);
     let mut prev_screen = parser.screen().clone();
     let mut pending_redraw = false;
+    let mut was_alt_screen = false;
+
+    // Protect status bar with scroll region on primary screen
+    set_scroll_region(stdout, content_rows);
 
     loop {
         // Handle pending SIGWINCH before anything else.
-        // Order matters: resize vt100 FIRST, then resize PTY.
-        // TIOCSWINSZ on the master makes the kernel deliver
-        // SIGWINCH to the child, so we must ensure the virtual
-        // terminal is already at the new size before the child
-        // starts redrawing.
+        // Order: resize vt100 FIRST, then re-render, then
+        // resize PTY (which delivers SIGWINCH to child).
         if SIGWINCH_PENDING.swap(false, Ordering::SeqCst) {
             let (rows, cols) =
                 real_term_size().unwrap_or((init_rows, init_cols));
             if rows >= 2 {
-                // 1. Resize virtual terminal
-                parser.screen_mut().set_size(rows - 1, cols);
+                content_rows = rows - 1;
+                content_cols = cols;
+                parser.screen_mut().set_size(content_rows, content_cols);
 
-                // 2. Clear real terminal and render current
-                //    vt100 content at the new size.
-                let stdout = nix::libc::STDOUT_FILENO;
-                write_all_raw(stdout, b"\x1b[H\x1b[J");
+                // Reset scroll region and clear screen
+                write_all_raw(stdout, b"\x1b[r\x1b[H\x1b[J");
+
+                // Re-establish scroll region for primary screen
                 let screen = parser.screen();
+                if !screen.alternate_screen() {
+                    set_scroll_region(stdout, content_rows);
+                }
+
+                // Re-render from vt100 state at new size
                 let output = screen.state_formatted();
                 write_all_raw(stdout, &output);
                 prev_screen = screen.clone();
+                was_alt_screen = screen.alternate_screen();
 
-                // 3. Redraw status bar on last row
+                // Redraw status bar, then notify child
                 crate::statusbar::redraw();
-
-                // 4. NOW resize PTY and explicitly forward
-                //    SIGWINCH to the child process group.
                 resize_pty();
                 forward_sigwinch();
 
@@ -191,10 +214,38 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                 match nix::unistd::read(master_raw, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        // Always process through vt100 for resize
+                        // recovery and alt-screen tracking.
                         parser.process(&buf[..n]);
                         let screen = parser.screen();
-                        let diff = screen.state_diff(&prev_screen);
-                        write_all_raw(nix::libc::STDOUT_FILENO, &diff);
+                        let now_alt = screen.alternate_screen();
+
+                        if now_alt != was_alt_screen {
+                            // Alt screen transition: full re-render
+                            if now_alt {
+                                // Entering alt: remove scroll region
+                                write_all_raw(stdout, b"\x1b[r");
+                            } else {
+                                // Leaving alt: restore scroll region
+                                set_scroll_region(stdout, content_rows);
+                            }
+                            write_all_raw(stdout, b"\x1b[H\x1b[J");
+                            let output = screen.state_formatted();
+                            write_all_raw(stdout, &output);
+                            was_alt_screen = now_alt;
+                        } else if now_alt {
+                            // Alt screen: cursor-addressed diff
+                            let diff = screen.state_diff(&prev_screen);
+                            write_all_raw(stdout, &diff);
+                        } else {
+                            // Primary screen: raw pass-through
+                            // for natural scrollback.
+                            write_all_raw(stdout, &buf[..n]);
+                            // Re-establish scroll region in case
+                            // child output contained a reset.
+                            set_scroll_region(stdout, content_rows);
+                        }
+
                         prev_screen = screen.clone();
                         pending_redraw = true;
                     }
@@ -216,7 +267,9 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
                 }
                 let screen = parser.screen();
                 let diff = screen.state_diff(&prev_screen);
-                write_all_raw(nix::libc::STDOUT_FILENO, &diff);
+                write_all_raw(stdout, &diff);
+                // Reset scroll region before exit
+                write_all_raw(stdout, b"\x1b[r");
                 crate::statusbar::redraw();
                 break;
             }
@@ -246,6 +299,10 @@ fn io_loop(master: &OwnedFd, init_rows: u16, init_cols: u16) {
             }
         }
     }
+
+    // Clean up: reset scroll region so terminal is in a
+    // known state after ai-jail exits.
+    write_all_raw(stdout, b"\x1b[r");
 }
 
 /// Write all bytes to a raw fd using libc::write (works in all
@@ -269,7 +326,7 @@ fn write_all_raw(fd: i32, data: &[u8]) {
 
 /// Run the command through a PTY proxy with virtual terminal.
 /// Creates PTY pair, enters raw mode, spawns child with PTY slave
-/// as stdio, runs IO loop with vt100 diff-rendering, waits for
+/// as stdio, runs IO loop with hybrid rendering, waits for
 /// child, restores terminal. Returns exit code.
 pub fn run(cmd: &mut std::process::Command) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
